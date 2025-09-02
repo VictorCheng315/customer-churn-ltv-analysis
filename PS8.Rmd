@@ -1,0 +1,552 @@
+---
+title: "PS 8"
+author: "Victor Cheng"
+date: "2023-11-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+setwd("/Users/victor_cheng/Desktop/Econ487")
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(ggthemes)
+  library(rpart)
+  library(rpart.plot)
+  library(partykit)
+  library(maptree)
+  library(glmnet)
+  library(janitor)
+  library(broom)
+  library(knitr)
+  library(xgboost)
+  library(rpart)
+  library(randomForest)
+  library(lmtest)
+  library(openxlsx)
+  library(dplyr)
+  library(lubridate)
+  library(scales)
+  library(tidyverse)
+})
+
+set.seed(487)
+```
+
+```{r}
+oj <- read_csv('/Users/victor_cheng/Desktop/Econ487/oj.csv')
+
+oj_tree <- oj %>% 
+  mutate(q = exp(logmove)) %>% 
+  group_by(store, week) %>% 
+  mutate(weighted_mean = weighted.mean(price, q)) %>% 
+  ungroup()
+
+oj_tree <- oj_tree %>% 
+  mutate(id_val = row_number())
+
+head(oj_tree)
+```
+
+
+```{r}
+tree_helper <- function(df) {
+  
+  reg_tree_data <- df %>% 
+  select(weighted_mean, AGE60:CPWVOL5)
+  
+  fit <- rpart(as.formula(weighted_mean ~ .),
+           data=reg_tree_data,
+           method="anova",
+           cp=.007)
+  
+  oj_leaves <- df %>% 
+  mutate(leaf = fit$where,
+         log_price = log(price))
+  
+  return (oj_leaves)
+
+}
+```
+
+```{r}
+new_df <- tree_helper(oj_tree)
+```
+
+```{r}
+
+
+rf_helper <- function(df){
+  
+  output_lst <- list()
+  
+  df_2 <- df %>% filter(leaf == 2)
+  df_4 <- df %>% filter(leaf == 4)
+  df_5 <- df %>% filter(leaf == 5)
+
+  df_lst <- list(df_2, df_4, df_5)
+
+  for (i in df_lst) {
+    first_half <- i %>%
+    slice_sample(prop = .5)
+  
+    second_half <- i %>%
+    anti_join(first_half,
+              by = 'id_val')
+    
+    rf_q_first_half_brand <- sapply(unique(oj$brand), function(x){
+      randomForest(
+        logmove ~ (. -log_price - price - feat - store - id_val)^2, 
+        data = first_half %>% filter(brand == x), 
+        ntree = 100, 
+        keep.forest=TRUE
+      )
+    }, simplify=FALSE, USE.NAMES = TRUE)
+  
+    rf_q_second_half_brand <- sapply(unique(oj$brand), function(x){
+      randomForest(
+        logmove ~ (. -log_price -price -feat -store -id_val)^2, 
+        data = second_half %>% filter(brand == x), 
+        ntree = 100, 
+        keep.forest=TRUE
+      )
+    }, simplify=FALSE, USE.NAMES = TRUE)
+  
+    rf_p_first_half_brand <- sapply(unique(oj$brand), function(x){
+      randomForest(
+        log_price ~ (. -logmove - price - feat - store - id_val)^2, 
+        data = first_half %>% filter(brand == x), 
+        ntree = 100, 
+        keep.forest=TRUE
+      )
+    }, simplify=FALSE, USE.NAMES = TRUE)
+  
+    rf_p_second_half_brand <- sapply(unique(oj$brand), function(x){
+      randomForest(
+        log_price ~ (. -logmove - price -feat -store -id_val)^2, 
+        data = second_half %>% filter(brand == x), 
+        ntree = 100, 
+        keep.forest=TRUE
+      )
+    }, simplify=FALSE, USE.NAMES = TRUE)
+  
+  
+  resid_half_brand <- bind_rows(
+  c(
+    lapply(unique(i$brand), function(x){
+      second_half %>% 
+        filter(brand == x) %>% 
+        mutate(q_hat = predict(rf_q_first_half_brand[[x]], newdata = .),
+               p_hat = predict(rf_p_first_half_brand[[x]], newdata = .),
+               q_resid_half_brand = logmove - q_hat,
+               p_resid_half_brand = log_price - p_hat)
+    }),
+    lapply(unique(i$brand), function(x){
+      first_half %>% 
+        filter(brand == x) %>% 
+        mutate(q_hat = predict(rf_q_second_half_brand[[x]], newdata = .),
+               p_hat = predict(rf_p_second_half_brand[[x]], newdata = .),
+               q_resid_half_brand = logmove - q_hat,
+               p_resid_half_brand = log_price - p_hat)
+          })
+        )
+      ) %>% 
+        select(store, week, brand, q_resid_half_brand, p_resid_half_brand,leaf)
+        
+  
+      output_lst <- append(output_lst, resid_half_brand)
+      
+  }
+  return(output_lst)
+}
+
+```
+
+```{r}
+result <- rf_helper(new_df)
+
+lf_2_result <- data.frame(result[1:6])
+
+lf_4_result <- data.frame(result[7:12])
+
+lf_5_result <- data.frame(result[13:18])
+```
+
+```{r}
+lf_2_result <- data.frame(result[1:6]) %>% rename(p_resid = p_resid_half_brand, q_resid = q_resid_half_brand)
+lf_4_result <- data.frame(result[7:12]) %>% rename(p_resid = p_resid_half_brand, q_resid = q_resid_half_brand)
+lf_5_result <- data.frame(result[13:18]) %>% rename(p_resid = p_resid_half_brand, q_resid = q_resid_half_brand)
+```
+
+```{r}
+oj_with_residuals_wide_2 <- lf_2_result %>% 
+  pivot_wider(id_cols = c(store,week), names_from = brand, values_from = c(q_resid,p_resid))
+
+cross_logprice_elasticity_matrix_2 <- function(df){
+  bind_rows(
+    lapply(unique(oj$brand), function(x){
+      lm(
+        formula(
+          str_c(
+            str_interp('q_resid_${x} ~ '),
+            str_c(str_c('p_resid_', unique(oj$brand)), collapse = ' + ')
+          )
+        ),
+        data = df
+      ) %>% 
+        tidy() %>% 
+        filter(str_detect(term, 'p_resid')) %>% 
+        mutate(q = x) %>% 
+        select(q, term, estimate) %>% 
+        pivot_wider(id_cols = q, names_from = term, values_from = estimate)
+    })
+  )
+}
+
+cross_logprice_elasticity_matrix_2(oj_with_residuals_wide_2) %>% 
+  kable()
+```
+
+```{r}
+oj_with_residuals_wide_4 <- lf_4_result %>% 
+  pivot_wider(id_cols = c(store,week), names_from = brand, values_from = c(q_resid,p_resid))
+
+cross_logprice_elasticity_matrix_4 <- function(df){
+  bind_rows(
+    lapply(unique(oj$brand), function(x){
+      lm(
+        formula(
+          str_c(
+            str_interp('q_resid_${x} ~ '),
+            str_c(str_c('p_resid_', unique(oj$brand)), collapse = ' + ')
+          )
+        ),
+        data = df
+      ) %>% 
+        tidy() %>% 
+        filter(str_detect(term, 'p_resid')) %>% 
+        mutate(q = x) %>% 
+        select(q, term, estimate) %>% 
+        pivot_wider(id_cols = q, names_from = term, values_from = estimate)
+    })
+  )
+}
+
+cross_logprice_elasticity_matrix_4(oj_with_residuals_wide_4) %>% 
+  kable()
+```
+
+```{r}
+oj_with_residuals_wide_5 <- lf_5_result %>% 
+  pivot_wider(id_cols = c(store,week), names_from = brand, values_from = c(q_resid,p_resid))
+
+cross_logprice_elasticity_matrix_5 <- function(df){
+  bind_rows(
+    lapply(unique(oj$brand), function(x){
+      lm(
+        formula(
+          str_c(
+            str_interp('q_resid_${x} ~ '),
+            str_c(str_c('p_resid_', unique(oj$brand)), collapse = ' + ')
+          )
+        ),
+        data = df
+      ) %>% 
+        tidy() %>% 
+        filter(str_detect(term, 'p_resid')) %>% 
+        mutate(q = x) %>% 
+        select(q, term, estimate) %>% 
+        pivot_wider(id_cols = q, names_from = term, values_from = estimate)
+    })
+  )
+}
+
+cross_logprice_elasticity_matrix_5(oj_with_residuals_wide_5) %>% 
+  kable()
+```
+
+```{r}
+plot_data_rm <- data.frame(lf_2_result)
+ggplot(plot_data_rm, aes(x = q_resid, y = p_resid)) +
+  geom_point() +
+  labs(x = "Quantity Residuals", y = "Price Residuals")
+```
+
+```{r}
+reg_q <- lm(logmove ~ (log_price+price+feat+store+id_val)^2, data=new_df)
+ols_q <- residuals(reg_q)
+
+reg_p <- lm(log_price ~ (logmove+price+feat+store+id_val)^2, data=new_df)
+ols_p <- residuals(reg_p)
+```
+
+```{r}
+ggplot(new_df, aes(x = ols_q, y = ols_p)) +
+  geom_point() +
+  labs(x = "Q residuals", y = "P residuals")
+```
+
+2.  
+
+a.  
+
+```{r}
+Total_revenue_in_million=1*0.3*0.5*10*(12-2)
+Total_revenue_in_million
+```
+
+b.  
+
+```{r}
+Total_costs_in_million=1*0.3*0.5*5*(12-2)+1*0.3*(12-10)*5
+Total_costs_in_million
+```
+
+c.  
+
+```{r}
+Gross_profit_in_million=15-10.5
+Gross_profit_in_million
+```
+
+```{r}
+Net_profit_in_million=4.5-1
+Net_profit_in_million
+```
+
+d.  
+
+```{r}
+New_total_revenue_in_million=1*0.28*0.45*10*(12-1)
+New_total_revenue_in_million
+```
+
+```{r}
+New_total_costs_in_million=1*0.28*0.45*5*(12-1)+1*0.28*(12-11)*5
+New_total_costs_in_million
+```
+
+```{r}
+New_gross_profit_in_million=13.86-8.33
+New_gross_profit_in_million
+```
+
+Since the gross margins increased, and the fix costs don't change, they should make the change.
+
+3.  
+
+```{r}
+data <- read.xlsx("/Users/victor_cheng/Desktop/Econ487/online_retail.xlsx")
+data$InvoiceDate <- convertToDate(data$InvoiceDate)
+or <- data[!is.na(data$CustomerID), ]
+```
+
+```{r}
+data$Year <- format(data$InvoiceDate, "%Y")
+data$Month <- format(data$InvoiceDate, "%m")
+```
+
+
+a.
+```{r}
+total_customers <- length(unique(data$CustomerID))
+
+total_countries <- length(unique(data$Country))
+
+total_revenue_by_country <- data %>%
+  group_by(Country) %>%
+  summarise(total_revenue = sum(UnitPrice * Quantity))
+
+average_revenue_by_customer_country <- or %>%
+  group_by(CustomerID, Country) %>%
+  summarise(average_revenue = mean(UnitPrice * Quantity), .groups = "drop")
+```
+
+b.
+```{r}
+total_revenue_by_customer <- or %>%
+  group_by(CustomerID) %>%
+  summarise(total_revenue = sum(UnitPrice * Quantity), .groups = "drop")
+```
+
+```{r}
+ggplot(total_revenue_by_customer, aes(x = total_revenue)) +
+  geom_histogram(binwidth =50, fill = "blue", color = "black") +
+  labs(x = "Total Revenue", y = "Number of Customers", 
+       title = "Distribution of Total Revenue by Customer")
+```
+c.
+```{r}
+customer_revenue <- or %>%
+  group_by(CustomerID) %>%
+  summarise(TotalRevenue = sum(UnitPrice * Quantity))
+
+sorted_customers <- customer_revenue %>%
+  arrange(desc(TotalRevenue))
+
+sorted_customers <- sorted_customers %>%
+  mutate(CumulativeRevenue = cumsum(TotalRevenue))
+
+total_revenue_sorted <- sum(sorted_customers$TotalRevenue)
+
+cutoff <- sorted_customers$CumulativeRevenue >= total_revenue_sorted * 0.8
+cutoff_point <- which(cutoff)[1]
+
+percent_customers <- (cutoff_point / nrow(sorted_customers)) * 100
+
+print(percent_customers)
+```
+
+d.
+```{r}
+churn_data <- or
+
+churn_data$churn_date <- or$InvoiceDate + 90
+churn_data <- churn_data %>% arrange(CustomerID, InvoiceDate)
+churn_data <- churn_data %>%
+  group_by(CustomerID) %>%
+  mutate(nextPurchaseTime = lead(InvoiceDate)) %>%
+  ungroup()
+
+churn_data$days_difference <- as.numeric(churn_data$nextPurchaseTime - churn_data$InvoiceDate)
+ 
+churn_data$indicator <- ifelse(churn_data$days_difference > 90, 1, 0)
+
+churn_data$Year <- format(churn_data$InvoiceDate, "%Y")
+churn_data$Month <- format(churn_data$InvoiceDate, "%m")
+
+monthly_churn_rate <- churn_data %>%
+  group_by(Month, Year) %>%
+  summarise(TotalCustomers = n_distinct(CustomerID),
+            ChurnedCustomers = sum(indicator, na.rm=TRUE),
+            ChurnRate = ChurnedCustomers / TotalCustomers,
+            ARPU = (sum(Quantity * UnitPrice)) / length(unique(CustomerID)),
+            LTV = ARPU / ChurnRate)
+
+churn_data <- churn_data %>%
+  mutate(Repurchase = ifelse(!is.na(nextPurchaseTime), 1, 0)) %>%
+  mutate(M = floor_date(InvoiceDate, "month"))
+
+churn_repurchase_rate <- churn_data %>%
+  filter(indicator == 1) %>%
+  group_by(M, Year) %>%
+  summarise(TotalChurnedCustomers = n_distinct(CustomerID),
+            RepurchasedChurnedCustomers = sum(Repurchase),
+            ChurnRepurchaseRate = RepurchasedChurnedCustomers / TotalChurnedCustomers)
+```
+
+e.
+
+```{r}
+print(monthly_churn_rate$LTV)
+```
+
+f.
+
+```{r}
+returns <- data %>%
+  filter(Quantity < 0)
+
+percent_orders_returned <- nrow(returns) / nrow(data) * 100
+
+total_revenue <- sum(data$UnitPrice * data$Quantity)
+returned_revenue <- sum(returns$UnitPrice * abs(returns$Quantity))
+fraction_revenue_returned <- returned_revenue / total_revenue
+
+print(paste("Percentage of orders returned: ", percent_orders_returned))
+print(paste("Fraction of total revenue returned: ", fraction_revenue_returned))
+```
+
+
+4.
+
+a.
+
+```{r}
+avg_sales_revenue_month <- data %>%
+  group_by(Month) %>%
+  summarise(Avg_Sales= mean(Quantity), 
+            Avg_Revenue= mean(UnitPrice*Quantity))
+```
+
+```{r}
+avg_sales_revenue_year <- data %>%
+  group_by(Year) %>%
+  summarise(Avg_Sales= mean(Quantity), 
+            Avg_Revenue= mean(UnitPrice*Quantity))
+```
+
+
+b.
+```{r}
+ggplot(avg_sales_revenue_month, aes(x = Month, y = Avg_Sales, group = 1)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Average Sales per Day by Month",
+       x = "Month", y = "Average Sales")
+
+ggplot(avg_sales_revenue_month, aes(x = Month, y = Avg_Revenue, group = 1)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Average Revenue per Day by Month",
+       x = "Month", y = "Average Revenue")
+
+ggplot(avg_sales_revenue_year, aes(x = Year, y = Avg_Sales, group = 1)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Average Sales per Day by Year",
+       x = "Year", y = "Average Sales")
+
+ggplot(avg_sales_revenue_year, aes(x = Year, y = Avg_Revenue, group = 1)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Average Revenue per Day by Year",
+       x = "Year", y = "Average Revenue")
+
+```
+
+c.
+No, because we don’t know if there is a certain causal relationship between advertising during the holidays and increased sales, it is more likely that holiday season could naturally lead to an increase in sales.
+
+5.
+
+a.
+```{r}
+earliest_purchase <- or %>%
+  group_by(CustomerID) %>%
+  summarise(EarliestPurchase = min(InvoiceDate))
+
+earliest_purchase$Month <- format(earliest_purchase$EarliestPurchase, "%m")
+earliest_purchase$Year <- format(earliest_purchase$EarliestPurchase, "%y")
+
+or <- merge(or, earliest_purchase, by = "CustomerID")
+```
+
+b.
+```{r}
+cohort_metrics <- or %>%
+  group_by(Month, Year) %>%
+  summarise(NumOrders = n(),
+            AvgOrderSize = mean(Quantity),
+            NumReturns = sum(sum(ifelse(Quantity < 0, 1, 0))),
+            AvgReturnSize = abs(mean(ifelse(Quantity < 0, Quantity, NA), na.rm = TRUE)))
+```
+
+c.
+We could introduce premium subscription level to the early cohorts with large order numbers and average order size, because they have been with company for a long time, and they bought a lot, so they may be appealed by the exclusive benefits, free shipping or special discounts offered by premium subscription level, and further stimulate their consumption. 
+
+For relatively new cohorts, we may want to introduce them with introductory subscription level, because they may not yet have enough confidence in the company's products, therefore, an introductory subscription level with lower payment but valuable benefits could increase their engagement.
+
+For cohorts with high return numbers and average return size, we can introduce them with subscriptions that offer fast and free returns. Therefore, when they want to buy goods, they will not be afraid of the hassle of returns, which will dampen their desire to consume.
+
+
+
+
+
+
+
